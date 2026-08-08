@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "要编译的 Tag（例如 v1.8.6），产物会发布到同名 Release"
+        description: "要编译的 Tag，必须填完整名字，如 dev_v1.11.4 或 v1.8.6（页面上方的分支选择框保持 master 不用动）"
         required: true
         type: string
       flutter_version:
@@ -34,8 +34,42 @@ on:
         type: boolean
 
 jobs:
+  # ===== 先校验 Tag 是否存在，避免后面报难懂的 git fetch 错误 =====
+  check-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify ref exists
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null; then
+            echo "::notice::Tag $TAG -> $(git rev-parse --short "refs/tags/$TAG^{commit}")"
+          elif git rev-parse -q --verify "refs/remotes/origin/$TAG" >/dev/null; then
+            echo "::notice::分支 $TAG -> $(git rev-parse --short "refs/remotes/origin/$TAG")"
+          else
+            echo "::error::仓库里找不到名为 '$TAG' 的 Tag 或分支，请核对拼写"
+            {
+              echo "### 找不到 \`$TAG\`"
+              echo ""
+              echo "最近的 20 个 Tag："
+              echo '```'
+              git tag --sort=-creatordate | head -20
+              echo '```'
+              echo "分支："
+              echo '```'
+              git branch -r | sed 's|origin/||'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
   # ===== Android =====
   build-android:
+    needs: check-tag
     if: ${{ inputs.build_android }}
     runs-on: ubuntu-latest
     steps:
@@ -112,6 +146,7 @@ jobs:
 
   # ===== Windows =====
   build-windows:
+    needs: check-tag
     if: ${{ inputs.build_windows }}
     runs-on: windows-latest
     steps:
@@ -154,6 +189,7 @@ jobs:
 
   # ===== Linux =====
   build-linux:
+    needs: check-tag
     if: ${{ inputs.build_linux }}
     runs-on: ubuntu-22.04
     steps:
@@ -200,7 +236,7 @@ jobs:
 
   # ===== 汇总发布到 Release =====
   release:
-    needs: [build-android, build-windows, build-linux]
+    needs: [check-tag, build-android, build-windows, build-linux]
     if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     permissions:
