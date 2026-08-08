@@ -1,0 +1,226 @@
+name: manual-build-release
+# 手动触发：指定任意 Tag 编译 Android / Windows / Linux 安装包并发布到 Release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要编译的 Tag（例如 v1.8.6），产物会发布到同名 Release"
+        required: true
+        type: string
+      flutter_version:
+        description: "Flutter 版本（旧 Tag 可能需要用旧版本，如 3.24.x）"
+        required: false
+        default: "3.38.x"
+        type: string
+      build_android:
+        description: "编译 Android APK"
+        required: false
+        default: true
+        type: boolean
+      build_windows:
+        description: "编译 Windows (zip + msix)"
+        required: false
+        default: true
+        type: boolean
+      build_linux:
+        description: "编译 Linux (deb + zip)"
+        required: false
+        default: true
+        type: boolean
+      prerelease:
+        description: "标记为预发布版本"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  # ===== Android =====
+  build-android:
+    if: ${{ inputs.build_android }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "17"
+          cache: "gradle"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version }}
+          cache: true
+
+      # 优先使用仓库 Secret 中的固定签名密钥，保证不同版本能覆盖安装
+      # 未配置 Secret 时回退到临时自签名密钥，仅用于应急，签名每次都不同
+      - name: Setup signing key
+        working-directory: simple_live_app/android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > keystore.jks
+            echo "::notice::使用仓库 Secret 中的固定签名密钥"
+          else
+            keytool -genkeypair -v \
+              -keystore keystore.jks -storetype PKCS12 \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -alias simplelive -storepass simplelive -keypass simplelive \
+              -dname "CN=Simple Live, OU=CI, O=Simple Live, L=NA, ST=NA, C=CN"
+            STORE_PASSWORD=simplelive
+            KEY_PASSWORD=simplelive
+            KEY_ALIAS=simplelive
+            echo "::warning::未配置 KEYSTORE_BASE64，本次使用临时自签名密钥，签名不固定，安装新版需先卸载旧版"
+          fi
+          {
+            echo "storeFile=$(pwd)/keystore.jks"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyPassword=$KEY_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+          } > key.properties
+
+      - name: Restore packages
+        working-directory: simple_live_app
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: simple_live_app
+        run: flutter build apk --release --split-per-abi
+
+      - name: Collect assets
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p release_assets
+          for f in simple_live_app/build/app/outputs/flutter-apk/app-*-release.apk; do
+            abi=$(basename "$f" | sed -e 's/^app-//' -e 's/-release\.apk$//')
+            cp "$f" "release_assets/SimpleLive-${TAG}-${abi}.apk"
+          done
+          ls -lh release_assets
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: release_assets/*
+
+  # ===== Windows =====
+  build-windows:
+    if: ${{ inputs.build_windows }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version }}
+          cache: true
+
+      - name: Enable Flutter Desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Restore packages
+        working-directory: simple_live_app
+        run: flutter pub get
+
+      - name: Install flutter_distributor
+        run: dart pub global activate flutter_distributor
+
+      - name: Build Windows
+        working-directory: simple_live_app
+        run: flutter_distributor package --platform windows --targets msix,zip --skip-clean
+
+      - name: Collect assets
+        shell: bash
+        run: |
+          mkdir -p release_assets
+          cp simple_live_app/build/dist/*/*.msix release_assets/
+          cp simple_live_app/build/dist/*/*.zip release_assets/
+          ls -lh release_assets
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: release_assets/*
+
+  # ===== Linux =====
+  build-linux:
+    if: ${{ inputs.build_linux }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version }}
+          cache: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libasound2-dev libmpv-dev mpv
+
+      - name: Enable Flutter Desktop
+        run: flutter config --enable-linux-desktop
+
+      - name: Restore packages
+        working-directory: simple_live_app
+        run: flutter pub get
+
+      - name: Install flutter_distributor
+        run: dart pub global activate flutter_distributor
+
+      - name: Build Linux
+        working-directory: simple_live_app
+        run: flutter_distributor package --platform linux --targets deb,zip --skip-clean
+
+      - name: Collect assets
+        run: |
+          mkdir -p release_assets
+          cp simple_live_app/build/dist/*/*.deb release_assets/
+          cp simple_live_app/build/dist/*/*.zip release_assets/
+          ls -lh release_assets
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: release_assets/*
+
+  # ===== 汇总发布到 Release =====
+  release:
+    needs: [build-android, build-windows, build-linux]
+    if: ${{ !cancelled() && !failure() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -lh dist
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ inputs.prerelease }}
+          token: ${{ secrets.TOKEN || secrets.GITHUB_TOKEN }}
+          files: dist/*
