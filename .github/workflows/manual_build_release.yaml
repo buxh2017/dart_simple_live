@@ -100,7 +100,16 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
           if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > keystore.jks
+            # 剔除粘贴时可能混入的换行、回车、空格，再解码
+            printf '%s' "$KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > keystore.jks 2>/dev/null || true
+            if [ ! -s keystore.jks ]; then
+              echo "::error::KEYSTORE_BASE64 解码失败，内容不是合法的 Base64（当前长度 ${#KEYSTORE_BASE64} 字符，应为 3680）。请重新完整复制 simple_live.jks.base64 的内容，注意不要带上 Markdown 的反引号或多余文本"
+              exit 1
+            fi
+            if ! keytool -list -keystore keystore.jks -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1; then
+              echo "::error::密钥库校验失败：STORE_PASSWORD 或 KEY_ALIAS 不正确，或 KEYSTORE_BASE64 内容被截断"
+              exit 1
+            fi
             echo "::notice::使用仓库 Secret 中的固定签名密钥"
           else
             keytool -genkeypair -v \
@@ -165,6 +174,12 @@ jobs:
     needs: check-tag
     if: ${{ inputs.build_windows }}
     runs-on: windows-latest
+    # flutter_inappwebview_windows、permission_handler_windows 仍在使用
+    # <experimental/coroutine>，新版 MSVC（VS 18 / 14.51）把它从警告升级为硬错误 C2338。
+    # CL 是 MSVC 的隐式命令行环境变量，在此定义官方给出的静默宏，
+    # 无需修改任何插件源码即可通过编译。
+    env:
+      CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
     steps:
       - uses: actions/checkout@v4
         with:
@@ -285,7 +300,13 @@ jobs:
   # ===== 汇总发布到 Release =====
   release:
     needs: [check-tag, build-android, build-windows, build-linux]
-    if: ${{ !cancelled() && !failure() }}
+    # 只要有任意一个平台构建成功就发布，不因其他平台失败而整体作废
+    if: >-
+      ${{ !cancelled()
+      && needs.check-tag.result == 'success'
+      && (needs.build-android.result == 'success'
+      || needs.build-windows.result == 'success'
+      || needs.build-linux.result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
